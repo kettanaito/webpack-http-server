@@ -1,6 +1,6 @@
 {
   "name": "webpack-http-server",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "On-demand runtime webpack compilations over HTTP",
   "main": "build/index.js",
   "typings": "build/index.d.ts",
