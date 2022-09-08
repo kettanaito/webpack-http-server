@@ -1,9 +1,11 @@
+import * as fs from 'fs'
 import * as path from 'path'
 import type { Server } from 'http'
 import { invariant } from 'outvariant'
 import * as crypto from 'crypto'
 import * as express from 'express'
 import * as webpack from 'webpack'
+import { render } from 'mustache'
 import { IFs, createFsFromVolume, Volume } from 'memfs'
 import { useMemoryFs } from './middleware/useMemoryFs'
 
@@ -12,16 +14,26 @@ export interface ServerOptions {
   webpackConfig?: Omit<webpack.Configuration, 'entry'>
 }
 
-export type CompilationResult = {
+export interface CompilationResult {
   id: string
   previewUrl: string
   stats: webpack.Stats
 }
 
+export interface CompilationOptions {
+  markup?: string
+}
+
+export interface CompilationRecord {
+  entries: string[]
+  stats: webpack.Stats
+  options: CompilationOptions
+}
+
 export class WebpackHttpServer {
   private app: express.Express
   private server: Server
-  private compilations: Map<string, webpack.Stats>
+  private compilations: Map<string, CompilationRecord>
   private fs: IFs
 
   constructor(private readonly options: ServerOptions = {}) {
@@ -58,13 +70,16 @@ export class WebpackHttpServer {
      * Handle a new compilation request.
      */
     this.app.post('/compilation', async (req, res) => {
-      const entries = Array.prototype.concat([], req.body.entry)
+      const { entry, markup } = req.body
+      const entries = Array.prototype.concat([], entry)
 
       if (!entries.every((entry) => path.isAbsolute(entry))) {
         return res.status(400).send('Entry path must be absolute.')
       }
 
-      const result = await this.compile(entries)
+      const result = await this.compile(entries, {
+        markup,
+      })
 
       return res.json({
         previewUrl: result.previewUrl,
@@ -107,17 +122,20 @@ export class WebpackHttpServer {
     })
   }
 
-  public async compile(entries: Array<string>): Promise<CompilationResult> {
+  public async compile(
+    entries: Array<string>,
+    options: CompilationOptions = {}
+  ): Promise<CompilationResult> {
     const compilationId = crypto.createHash('md5').digest('hex')
 
     const config: webpack.Configuration = {
       ...(this.options.webpackConfig || {}),
       mode: 'development',
-      output: {
-        path: path.resolve('compilation', compilationId, 'dist'),
-      },
       entry: {
         main: entries,
+      },
+      output: {
+        path: path.resolve('compilation', compilationId, 'dist'),
       },
     }
 
@@ -134,7 +152,12 @@ export class WebpackHttpServer {
           return
         }
 
-        this.handleIncrementalBuild(compilationId, stats)
+        this.handleIncrementalBuild(compilationId, {
+          entries,
+          stats,
+          options,
+        })
+
         const previewUrl = new URL(
           `/compilation/${compilationId}`,
           this.serverUrl
@@ -151,9 +174,9 @@ export class WebpackHttpServer {
 
   private handleIncrementalBuild(
     compilationId: string,
-    stats: webpack.Stats
+    record: CompilationRecord
   ): void {
-    this.compilations.set(compilationId, stats)
+    this.compilations.set(compilationId, record)
   }
 
   private async renderPreview(compilationId: string): Promise<string> {
@@ -164,12 +187,12 @@ export class WebpackHttpServer {
     )
 
     const compilation = this.compilations.get(compilationId)
-    const entries = compilation.compilation.entries
+    const entries = compilation.stats.compilation.entries
       .get('main')
       .dependencies.map((dependency) => {
         return (dependency as any).request
       })
-    const { chunks } = compilation.compilation
+    const { chunks } = compilation.stats.compilation
     const assets: Array<string> = []
 
     for (const chunk of chunks) {
@@ -178,24 +201,32 @@ export class WebpackHttpServer {
       }
     }
 
-    return `\
+    const customTemplate = compilation.options.markup
+      ? fs.readFileSync(compilation.options.markup, 'utf8')
+      : ''
+    const template = `
 <html>
   <head>
     <title>Preview</title>
   </head>
   <body>
     <h2>Preview</h2>
-    <ul>${entries
-      .map(
-        (filePath) => `
-<li><a href="vscode://file${filePath}">${filePath}</a></li>
-    `
-      )
-      .join('')}</ul>
-    ${assets
-      .map((assetPath) => `<script src="${assetPath}"></script>`)
-      .join('')}
+    {{#entries}}
+      <li><a href="vscode://file{{ . }}">{{ . }}</a></li>
+    {{/entries}}
+
+    ${customTemplate}
+
+    {{#assets}}
+      <script type="application/javascript" src="{{ . }}"></script>
+    {{/assets}}
   </body>
-</html>`
+</html
+    `
+
+    return render(template, {
+      entries,
+      assets,
+    })
   }
 }
