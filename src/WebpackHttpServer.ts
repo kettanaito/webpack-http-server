@@ -103,7 +103,7 @@ export class WebpackHttpServer {
 
   public async listen(): Promise<void> {
     return new Promise((resolve) => {
-      this.server = this.app.listen(8044, '127.0.0.1', resolve)
+      this.server = this.app.listen(0, '127.0.0.1', resolve)
     })
   }
 
