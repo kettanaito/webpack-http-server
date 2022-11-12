@@ -8,14 +8,14 @@
   "license": "MIT",
   "files": [
     "./build",
-    "./empty-entry.js",
+    "./empty-entry.js"
   ],
   "scripts": {
-    "start": "yarn build -w",
+    "start": "pnpm build -w",
     "prebuild": "rimraf ./build",
     "build": "tsc",
     "release": "release publish",
-    "prepublishOnly": "yarn build"
+    "prepublishOnly": "pnpm build"
   },
   "dependencies": {
     "@types/express": "^4.17.13",
