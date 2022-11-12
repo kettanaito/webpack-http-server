@@ -2,10 +2,10 @@ import * as path from 'path'
 import type { RequestHandler } from 'express'
 import type { IFs } from 'memfs'
 
-export function useMemoryFs(
+export function withMemoryFs(
   fs: IFs
 ): RequestHandler<{ id: string; assetPath: string }> {
-  return (req, res) => {
+  return (req, res, next) => {
     const filePath = path.join(
       'compilation',
       req.params.id,
@@ -14,7 +14,11 @@ export function useMemoryFs(
     )
 
     if (!fs.existsSync(filePath)) {
-      return res.status(404)
+      // Execute the next middleware because the consumer
+      // may attach custom router to the compilation URL,
+      // serving assets from the compilation route that were
+      // not originally present in the compilation.
+      return next()
     }
 
     const stream = fs.createReadStream(filePath, 'utf8')

@@ -7,7 +7,7 @@ import * as express from 'express'
 import * as webpack from 'webpack'
 import { render } from 'mustache'
 import { IFs, createFsFromVolume, Volume } from 'memfs'
-import { useMemoryFs } from './middleware/useMemoryFs'
+import { withMemoryFs } from './middleware/withMemoryFs'
 
 export interface ServerOptions {
   before?(app: express.Application): void
@@ -18,6 +18,7 @@ export interface CompilationResult {
   id: string
   previewUrl: string
   stats: webpack.Stats
+  use(routes: (router: express.Router) => void): void
 }
 
 export interface CompilationOptions {
@@ -64,7 +65,7 @@ export class WebpackHttpServer {
     /**
      * Serve compilation assets from the memory FS.
      */
-    this.app.use('/compilation/:id/:assetPath', useMemoryFs(this.fs))
+    this.app.use('/compilation/:id/:assetPath', withMemoryFs(this.fs))
 
     /**
      * Handle a new compilation request.
@@ -126,13 +127,16 @@ export class WebpackHttpServer {
     entries: Array<string>,
     options: CompilationOptions = {}
   ): Promise<CompilationResult> {
-    const compilationId = crypto.createHash('md5').digest('hex')
+    const resolvedEntries =
+      entries.length === 0 ? [require.resolve('../empty-entry.js')] : entries
+
+    const compilationId = crypto.randomBytes(16).toString('hex')
 
     const config: webpack.Configuration = {
       ...(this.options.webpackConfig || {}),
       mode: 'development',
       entry: {
-        main: entries,
+        main: resolvedEntries,
       },
       output: {
         path: path.resolve('compilation', compilationId, 'dist'),
@@ -153,20 +157,23 @@ export class WebpackHttpServer {
         }
 
         this.handleIncrementalBuild(compilationId, {
-          entries,
+          entries: resolvedEntries,
           stats,
           options,
         })
 
-        const previewUrl = new URL(
-          `/compilation/${compilationId}`,
-          this.serverUrl
-        ).href
+        const routeUrl = `/compilation/${compilationId}/`
+        const previewUrl = new URL(`${routeUrl}`, this.serverUrl).href
 
         resolve({
           id: compilationId,
           previewUrl,
           stats,
+          use: (routes) => {
+            const router = express.Router()
+            routes(router)
+            this.app.use(routeUrl, router)
+          },
         })
       })
     })
@@ -202,8 +209,11 @@ export class WebpackHttpServer {
     }
 
     const customTemplate = compilation.options.markup
-      ? fs.readFileSync(compilation.options.markup, 'utf8')
+      ? fs.existsSync(compilation.options.markup)
+        ? fs.readFileSync(compilation.options.markup, 'utf8')
+        : compilation.options.markup
       : ''
+
     const template = `
 <html>
   <head>
