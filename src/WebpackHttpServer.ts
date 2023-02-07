@@ -102,9 +102,12 @@ export class WebpackHttpServer {
     return `http://127.0.0.1:${address.port}`
   }
 
-  public async listen(): Promise<void> {
+  public async listen(
+    port: number = 0,
+    hostname: string = '127.0.0.1'
+  ): Promise<void> {
     return new Promise((resolve) => {
-      this.server = this.app.listen(0, '127.0.0.1', resolve)
+      this.server = this.app.listen(port, hostname, resolve)
     })
   }
 
