@@ -129,57 +129,36 @@ export class WebpackHttpServer {
   public async compile(
     entries: Array<string>,
     options: CompilationOptions = {}
-  ): Promise<CompilationResult> {
+  ): Promise<Compilation> {
     const resolvedEntries =
       entries.length === 0 ? [require.resolve('../empty-entry.js')] : entries
 
-    const compilationId = crypto.randomBytes(16).toString('hex')
+    const compilation = new Compilation({
+      app: this.app,
+      serverUrl: this.serverUrl,
+      fs: this.fs,
+    })
 
-    const config: webpack.Configuration = {
+    const webpackConfig: webpack.Configuration = {
       ...(this.options.webpackConfig || {}),
       mode: 'development',
       entry: {
         main: resolvedEntries,
       },
       output: {
-        path: path.resolve('compilation', compilationId, 'dist'),
+        path: path.resolve('compilation', compilation.id, 'dist'),
       },
     }
 
-    const compiler = webpack(config)
-
-    // Compile assets to memory so that the preview could
-    // serve those assets from memory also.
-    compiler.outputFileSystem = this.fs
-
-    return new Promise((resolve) => {
-      compiler.watch({ poll: 1000 }, (error, stats) => {
-        if (error || stats.hasErrors()) {
-          console.error('Compiled with errors:', error || stats.toJson().errors)
-          return
-        }
-
-        this.handleIncrementalBuild(compilationId, {
-          entries: resolvedEntries,
-          stats,
-          options,
-        })
-
-        const routeUrl = `/compilation/${compilationId}/`
-        const previewUrl = new URL(`${routeUrl}`, this.serverUrl).href
-
-        resolve({
-          id: compilationId,
-          previewUrl,
-          stats,
-          use: (routes) => {
-            const router = express.Router()
-            routes(router)
-            this.app.use(routeUrl, router)
-          },
-        })
+    await compilation.compile(webpackConfig).then((stats) => {
+      this.handleIncrementalBuild(compilation.id, {
+        entries: resolvedEntries,
+        stats,
+        options,
       })
     })
+
+    return compilation
   }
 
   private handleIncrementalBuild(
@@ -241,5 +220,71 @@ export class WebpackHttpServer {
       entries,
       assets,
     })
+  }
+}
+
+export interface CompilationConstructOptions {
+  app: express.Application
+  serverUrl: string
+  fs?: IFs
+}
+
+export class Compilation {
+  public id: string
+  public previewUrl: string
+  public previewRoute: string
+  public stats?: webpack.Stats
+
+  static createPreviewRoute(compilationId: string): string {
+    return `/compilation/${compilationId}/`
+  }
+
+  static createPreviewUrl(compilationId: string, serverUrl: string | URL): URL {
+    return new URL(Compilation.createPreviewRoute(compilationId), serverUrl)
+  }
+
+  constructor(private options: CompilationConstructOptions) {
+    this.id = crypto.randomBytes(16).toString('hex')
+    this.previewRoute = Compilation.createPreviewRoute(this.id)
+    this.previewUrl = Compilation.createPreviewUrl(
+      this.id,
+      this.options.serverUrl
+    ).href
+  }
+
+  public async compile(
+    webpackConfig?: webpack.Configuration
+  ): Promise<webpack.Stats> {
+    const compiler = webpack(webpackConfig)
+
+    if (this.options.fs) {
+      // Support compiling assets to memory.
+      // This way they can be served from the memory later on.
+      compiler.outputFileSystem = this.options.fs
+    }
+
+    return new Promise((resolve, reject) => {
+      compiler.watch({ poll: 1000 }, (error, stats) => {
+        if (error || stats.hasErrors()) {
+          const resolvedErrors = error || stats.toJson().errors
+          console.error('Compiled with errors:', resolvedErrors)
+          return reject(resolvedErrors)
+        }
+
+        this.stats = stats
+        resolve(stats)
+      })
+    })
+  }
+
+  public use(routes: (router: express.Router) => void): void {
+    const router = express.Router()
+    routes(router)
+    this.options.app.use(this.previewRoute, router)
+
+    /**
+     * @todo Keep track of the appended routes to clean them up
+     * in the dispose method in the future.
+     */
   }
 }
