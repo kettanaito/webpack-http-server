@@ -235,6 +235,8 @@ export class Compilation {
   public previewRoute: string
   public stats?: webpack.Stats
 
+  private compilers: Array<webpack.Compiler> = []
+
   static createPreviewRoute(compilationId: string): string {
     return `/compilation/${compilationId}/`
   }
@@ -256,6 +258,7 @@ export class Compilation {
     webpackConfig?: webpack.Configuration
   ): Promise<webpack.Stats> {
     const compiler = webpack(webpackConfig)
+    this.compilers.push(compiler)
 
     if (this.options.fs) {
       // Support compiling assets to memory.
@@ -286,5 +289,24 @@ export class Compilation {
      * @todo Keep track of the appended routes to clean them up
      * in the dispose method in the future.
      */
+  }
+
+  /**
+   * Disposes of this compilation, freeing memory occupied
+   * by the webpack compilers.
+   */
+  public async dispose(): Promise<void> {
+    const onceCompilersClosed = this.compilers.map((compiler) => {
+      return new Promise<void>((resolve, reject) => {
+        compiler.close((error) => {
+          if (error) {
+            return reject(error)
+          }
+          resolve()
+        })
+      })
+    })
+
+    return Promise.all(onceCompilersClosed).then(() => void 0)
   }
 }
