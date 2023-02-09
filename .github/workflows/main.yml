@@ -32,6 +32,10 @@ jobs:
       - name: Build
         run: pnpm build
 
+      - name: Configure private publishing
+        if: github.ref == 'refs/heads/main'
+        run: 'echo "//registry.npmjs.org/:_authToken=\${NPM_AUTH_TOKEN}" >> .npmrc'
+
       - name: Release
         if: github.ref == 'refs/heads/main'
         run: pnpm release
