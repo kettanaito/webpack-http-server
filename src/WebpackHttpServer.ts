@@ -1,6 +1,7 @@
 import * as fs from 'fs'
 import * as path from 'path'
 import type { Server } from 'http'
+import { EventEmitter } from 'events'
 import { invariant } from 'outvariant'
 import * as crypto from 'crypto'
 import * as express from 'express'
@@ -14,20 +15,13 @@ export interface ServerOptions {
   webpackConfig?: Omit<webpack.Configuration, 'entry'>
 }
 
-export interface CompilationResult {
-  id: string
-  previewUrl: string
-  stats: webpack.Stats
-  use(routes: (router: express.Router) => void): void
-}
-
 export interface CompilationOptions {
   markup?: string
 }
 
 export interface CompilationRecord {
-  entries: string[]
-  stats: webpack.Stats
+  entries: Array<string>
+  compilation: Compilation
   options: CompilationOptions
 }
 
@@ -150,10 +144,14 @@ export class WebpackHttpServer {
       },
     }
 
+    compilation.once('disposed', () => {
+      this.compilations.delete(compilation.id)
+    })
+
     await compilation.compile(webpackConfig).then((stats) => {
       this.handleIncrementalBuild(compilation.id, {
         entries: resolvedEntries,
-        stats,
+        compilation,
         options,
       })
     })
@@ -175,7 +173,13 @@ export class WebpackHttpServer {
       compilationId
     )
 
-    const compilation = this.compilations.get(compilationId)
+    const { compilation, options: compilationOptions } =
+      this.compilations.get(compilationId)
+
+    if (!compilation.stats) {
+      return `No webpack stats found for compilation "${compilation.id}"`
+    }
+
     const entries = compilation.stats.compilation.entries
       .get('main')
       .dependencies.map((dependency) => {
@@ -190,10 +194,10 @@ export class WebpackHttpServer {
       }
     }
 
-    const customTemplate = compilation.options.markup
-      ? fs.existsSync(compilation.options.markup)
-        ? fs.readFileSync(compilation.options.markup, 'utf8')
-        : compilation.options.markup
+    const customTemplate = compilationOptions.markup
+      ? fs.existsSync(compilationOptions.markup)
+        ? fs.readFileSync(compilationOptions.markup, 'utf8')
+        : compilationOptions.markup
       : ''
 
     const template = `
@@ -229,8 +233,11 @@ export interface CompilationConstructOptions {
   fs?: IFs
 }
 
-export class Compilation {
+export type CompilationState = 'active' | 'disposed'
+
+export class Compilation extends EventEmitter {
   public id: string
+  public state: CompilationState
   public previewUrl: string
   public previewRoute: string
   public stats?: webpack.Stats
@@ -246,17 +253,27 @@ export class Compilation {
   }
 
   constructor(private options: CompilationConstructOptions) {
+    super()
+
     this.id = crypto.randomBytes(16).toString('hex')
     this.previewRoute = Compilation.createPreviewRoute(this.id)
     this.previewUrl = Compilation.createPreviewUrl(
       this.id,
       this.options.serverUrl
     ).href
+    this.state = 'active'
   }
 
   public async compile(
-    webpackConfig?: webpack.Configuration
+    webpackConfig: webpack.Configuration
   ): Promise<webpack.Stats> {
+    invariant(
+      this.state === 'active',
+      '[Compilation] Cannot perform compilation "%s" for "%j": compilation has been disposed',
+      this.id,
+      webpackConfig.entry
+    )
+
     const compiler = webpack(webpackConfig)
     this.compilers.push(compiler)
 
@@ -284,11 +301,6 @@ export class Compilation {
     const router = express.Router()
     routes(router)
     this.options.app.use(this.previewRoute, router)
-
-    /**
-     * @todo Keep track of the appended routes to clean them up
-     * in the dispose method in the future.
-     */
   }
 
   /**
@@ -296,6 +308,14 @@ export class Compilation {
    * by the webpack compilers.
    */
   public async dispose(): Promise<void> {
+    invariant(
+      this.state === 'active',
+      '[Compilation] Failed to dispose of the compilation "%s": already disposed',
+      this.id
+    )
+
+    this.state = 'disposed'
+
     const onceCompilersClosed = this.compilers.map((compiler) => {
       return new Promise<void>((resolve, reject) => {
         compiler.close((error) => {
@@ -307,6 +327,8 @@ export class Compilation {
       })
     })
 
-    return Promise.all(onceCompilersClosed).then(() => void 0)
+    await Promise.all(onceCompilersClosed).then(() => void 0)
+
+    this.emit('disposed')
   }
 }
