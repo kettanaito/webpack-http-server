@@ -1,6 +1,7 @@
 import * as fs from 'fs'
 import * as path from 'path'
 import type { Server } from 'http'
+import { EventEmitter } from 'events'
 import { invariant } from 'outvariant'
 import * as crypto from 'crypto'
 import * as express from 'express'
@@ -14,20 +15,13 @@ export interface ServerOptions {
   webpackConfig?: Omit<webpack.Configuration, 'entry'>
 }
 
-export interface CompilationResult {
-  id: string
-  previewUrl: string
-  stats: webpack.Stats
-  use(routes: (router: express.Router) => void): void
-}
-
 export interface CompilationOptions {
   markup?: string
 }
 
 export interface CompilationRecord {
-  entries: string[]
-  stats: webpack.Stats
+  entries: Array<string>
+  compilation: Compilation
   options: CompilationOptions
 }
 
@@ -129,57 +123,40 @@ export class WebpackHttpServer {
   public async compile(
     entries: Array<string>,
     options: CompilationOptions = {}
-  ): Promise<CompilationResult> {
+  ): Promise<Compilation> {
     const resolvedEntries =
       entries.length === 0 ? [require.resolve('../empty-entry.js')] : entries
 
-    const compilationId = crypto.randomBytes(16).toString('hex')
+    const compilation = new Compilation({
+      app: this.app,
+      serverUrl: this.serverUrl,
+      fs: this.fs,
+    })
 
-    const config: webpack.Configuration = {
+    const webpackConfig: webpack.Configuration = {
       ...(this.options.webpackConfig || {}),
       mode: 'development',
       entry: {
         main: resolvedEntries,
       },
       output: {
-        path: path.resolve('compilation', compilationId, 'dist'),
+        path: path.resolve('compilation', compilation.id, 'dist'),
       },
     }
 
-    const compiler = webpack(config)
+    compilation.once('disposed', () => {
+      this.compilations.delete(compilation.id)
+    })
 
-    // Compile assets to memory so that the preview could
-    // serve those assets from memory also.
-    compiler.outputFileSystem = this.fs
-
-    return new Promise((resolve) => {
-      compiler.watch({ poll: 1000 }, (error, stats) => {
-        if (error || stats.hasErrors()) {
-          console.error('Compiled with errors:', error || stats.toJson().errors)
-          return
-        }
-
-        this.handleIncrementalBuild(compilationId, {
-          entries: resolvedEntries,
-          stats,
-          options,
-        })
-
-        const routeUrl = `/compilation/${compilationId}/`
-        const previewUrl = new URL(`${routeUrl}`, this.serverUrl).href
-
-        resolve({
-          id: compilationId,
-          previewUrl,
-          stats,
-          use: (routes) => {
-            const router = express.Router()
-            routes(router)
-            this.app.use(routeUrl, router)
-          },
-        })
+    await compilation.compile(webpackConfig).then((stats) => {
+      this.handleIncrementalBuild(compilation.id, {
+        entries: resolvedEntries,
+        compilation,
+        options,
       })
     })
+
+    return compilation
   }
 
   private handleIncrementalBuild(
@@ -196,7 +173,13 @@ export class WebpackHttpServer {
       compilationId
     )
 
-    const compilation = this.compilations.get(compilationId)
+    const { compilation, options: compilationOptions } =
+      this.compilations.get(compilationId)
+
+    if (!compilation.stats) {
+      return `No webpack stats found for compilation "${compilation.id}"`
+    }
+
     const entries = compilation.stats.compilation.entries
       .get('main')
       .dependencies.map((dependency) => {
@@ -211,10 +194,10 @@ export class WebpackHttpServer {
       }
     }
 
-    const customTemplate = compilation.options.markup
-      ? fs.existsSync(compilation.options.markup)
-        ? fs.readFileSync(compilation.options.markup, 'utf8')
-        : compilation.options.markup
+    const customTemplate = compilationOptions.markup
+      ? fs.existsSync(compilationOptions.markup)
+        ? fs.readFileSync(compilationOptions.markup, 'utf8')
+        : compilationOptions.markup
       : ''
 
     const template = `
@@ -241,5 +224,111 @@ export class WebpackHttpServer {
       entries,
       assets,
     })
+  }
+}
+
+export interface CompilationConstructOptions {
+  app: express.Application
+  serverUrl: string
+  fs?: IFs
+}
+
+export type CompilationState = 'active' | 'disposed'
+
+export class Compilation extends EventEmitter {
+  public id: string
+  public state: CompilationState
+  public previewUrl: string
+  public previewRoute: string
+  public stats?: webpack.Stats
+
+  private compilers: Array<webpack.Compiler> = []
+
+  static createPreviewRoute(compilationId: string): string {
+    return `/compilation/${compilationId}/`
+  }
+
+  static createPreviewUrl(compilationId: string, serverUrl: string | URL): URL {
+    return new URL(Compilation.createPreviewRoute(compilationId), serverUrl)
+  }
+
+  constructor(private options: CompilationConstructOptions) {
+    super()
+
+    this.id = crypto.randomBytes(16).toString('hex')
+    this.previewRoute = Compilation.createPreviewRoute(this.id)
+    this.previewUrl = Compilation.createPreviewUrl(
+      this.id,
+      this.options.serverUrl
+    ).href
+    this.state = 'active'
+  }
+
+  public async compile(
+    webpackConfig: webpack.Configuration
+  ): Promise<webpack.Stats> {
+    invariant(
+      this.state === 'active',
+      '[Compilation] Cannot perform compilation "%s" for "%j": compilation has been disposed',
+      this.id,
+      webpackConfig.entry
+    )
+
+    const compiler = webpack(webpackConfig)
+    this.compilers.push(compiler)
+
+    if (this.options.fs) {
+      // Support compiling assets to memory.
+      // This way they can be served from the memory later on.
+      compiler.outputFileSystem = this.options.fs
+    }
+
+    return new Promise((resolve, reject) => {
+      compiler.watch({ poll: 1000 }, (error, stats) => {
+        if (error || stats.hasErrors()) {
+          const resolvedErrors = error || stats.toJson().errors
+          console.error('Compiled with errors:', resolvedErrors)
+          return reject(resolvedErrors)
+        }
+
+        this.stats = stats
+        resolve(stats)
+      })
+    })
+  }
+
+  public use(routes: (router: express.Router) => void): void {
+    const router = express.Router()
+    routes(router)
+    this.options.app.use(this.previewRoute, router)
+  }
+
+  /**
+   * Disposes of this compilation, freeing memory occupied
+   * by the webpack compilers.
+   */
+  public async dispose(): Promise<void> {
+    invariant(
+      this.state === 'active',
+      '[Compilation] Failed to dispose of the compilation "%s": already disposed',
+      this.id
+    )
+
+    this.state = 'disposed'
+
+    const onceCompilersClosed = this.compilers.map((compiler) => {
+      return new Promise<void>((resolve, reject) => {
+        compiler.close((error) => {
+          if (error) {
+            return reject(error)
+          }
+          resolve()
+        })
+      })
+    })
+
+    await Promise.all(onceCompilersClosed).then(() => void 0)
+
+    this.emit('disposed')
   }
 }
